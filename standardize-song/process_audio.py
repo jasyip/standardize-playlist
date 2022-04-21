@@ -8,7 +8,7 @@ from collections.abc import Iterable
 from fractions import Fraction
 from math import isfinite
 from pathlib import Path
-from typing import Any, NoReturn, Optional
+from typing import Any, Optional
 
 
 import pyloudnorm as pyln
@@ -34,7 +34,6 @@ from pydub import AudioSegment
 _logger = logging.getLogger(__name__)
 
 
-_SILENCE_THRESHOLD = -16.0
 
 
 
@@ -45,9 +44,7 @@ _SILENCE_THRESHOLD = -16.0
 
 
 
-
-
-def _type_assert(obj: Any, t: type | Iterable[type]) -> NoReturn:
+def _type_assert(obj: Any, t: type | Iterable[type]) -> None:
 
     if isinstance(t, Iterable):
         t = tuple(t)
@@ -55,7 +52,7 @@ def _type_assert(obj: Any, t: type | Iterable[type]) -> NoReturn:
         raise TypeError(f"{obj} must be {' or '.join(map(str, t)) if isinstance(t, tuple) else t}")
 
 
-def _value_assert(b: bool, message: str) -> NoReturn:
+def _value_assert(b: bool, message: str) -> None:
     if not b:
         raise ValueError(message)
 
@@ -65,7 +62,8 @@ def _value_assert(b: bool, message: str) -> NoReturn:
 
 
 def silent_end_ind(sound: AudioSegment,
-                   silence_threshold: int | float = _SILENCE_THRESHOLD,
+                   /,
+                   silence_threshold: int | float = -50.0,
                    chunk_size: int = 1,
                   ) -> int:
 
@@ -116,11 +114,11 @@ def silent_end_ind(sound: AudioSegment,
 def process_song(
                  input_audio        ,
                  output_audio = None,
-                 allow_overwrite     : bool           = False,
-                 lufs_normalize      : int | float    = -14.0,
-                 silence_threshold   : int | float    = _SILENCE_THRESHOLD,
-                 iteration_chunk_len : int | Fraction = 1,
-                 silence_padding     : int            = 0,
+                 allow_overwrite     : bool                  = False,
+                 lufs_normalize      : int | float           = -14.0,
+                 silence_threshold   : Optional[int | float] = None,
+                 iteration_chunk_len : int | Fraction        = 1,
+                 silence_padding     : int                   = 0,
                 ) -> Optional[io.BytesIO]:
 
     # argument type and value checking
@@ -136,14 +134,15 @@ def process_song(
 
     _value_assert(lufs_normalize <= 0, "'lufs_normalize' must be non-positive number")
 
-    _type_assert(silence_threshold, (int, float))
+    if silence_threshold is not None:
+        _type_assert(silence_threshold, (int, float))
 
-    _value_assert(not isinstance(silence_threshold, float)
-                  or  isfinite(silence_threshold),
-                  "'silence_threshold' must be finite.",
-                 )
+        _value_assert(not isinstance(silence_threshold, float)
+                      or  isfinite(silence_threshold),
+                      "'silence_threshold' must be finite.",
+                     )
 
-    _value_assert(silence_threshold < 0, "'silence_threshold' must be negative number")
+        _value_assert(silence_threshold < 0, "'silence_threshold' must be negative number")
 
 
     _type_assert(iteration_chunk_len, (int, Fraction))
@@ -195,16 +194,22 @@ def process_song(
     _logger.debug("Length of 'input_audio': %d ms", len(song))
 
     if isinstance(iteration_chunk_len, Fraction):
-        iteration_chunk_len = max(round(iteration_chunk_len* len(song)), 1)
+        iteration_chunk_len = max(round(iteration_chunk_len * len(song)), 1)
 
 
     _logger.debug(f"{iteration_chunk_len=} ms")
 
 
+    local_args = locals()
+    silent_end_ind_args = { arg : local_args[arg] for arg in {
+                                                              "silence_threshold",
+                                                              "iteration_chunk_len",
+                                                             }}
+    silent_end_ind_args = { k : v for k, v in silent_end_ind_args.items() if v is not None}
+
     if (silent_leading_ind  := silent_end_ind(
                                               song,
-                                              silence_threshold,
-                                              iteration_chunk_len,
+                                              **silent_end_ind_args,
                                              )) not in {0, len(song)}:
         song = song[ silent_leading_ind : ]
         _logger.debug("{silent_leading_ind=} ms")
@@ -214,8 +219,7 @@ def process_song(
 
     if (silent_trailing_ind := silent_end_ind(
                                               song,
-                                              silence_threshold,
-                                              -iteration_chunk_len,
+                                              **silent_end_ind_args,
                                              )) not in {0, len(song)}:
         song = song[ : silent_trailing_ind ]
         _logger.debug("{silent_trailing_ind=} ms")
@@ -258,8 +262,7 @@ def process_song(
 
     sf.write(output_audio, loudness_normalized_audio, rate)
 
-    if return_stream:
-        return output_audio
+    return output_audio if return_stream else None
 
 
 
@@ -281,20 +284,20 @@ if __name__ == "__main__":
     meta_group = parser.add_argument_group("meta arguments")
 
     meta_group.add_argument(
-                            "--allow-overwrite",
+                            "-a", "--allow-overwrite",
                             action="store_true",
                             help=' '.join(("If 'input_audio' and 'output_audio' are the same path,",
                                            "this must be passed to show explicit approval.",
                                           )),
                            )
 
-    meta_group.add_argument("--debug", action="store_true")
+    meta_group.add_argument("-d", "--debug", action="store_true")
 
 
     var_group = parser.add_argument_group("variable arguments")
 
     var_group.add_argument(
-                           "--lufs-normalize",
+                           "-l", "--lufs-normalize",
                            default=argparse.SUPPRESS,
                            type=float,
                            help="Loudness standard to normalize to in LUFS. Must be <= 0.",
@@ -319,7 +322,7 @@ if __name__ == "__main__":
                            "--silence-padding",
                            default=argparse.SUPPRESS,
                            type=int,
-                           help="Silence padded to each end in ms. Must be integer > 0.",
+                           help="Silence padded to each end in ms. Must be integer >= 0.",
                           )
 
 
