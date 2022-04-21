@@ -1,29 +1,67 @@
 #!/usr/bin/env python
 
 import argparse
+import io
 import logging
 import sys
-import io
-from pathlib import Path
-from typing import Optional, NoReturn
-
+from collections.abc import Iterable
 from fractions import Fraction
+from math import isfinite
+from pathlib import Path
+from typing import Any, NoReturn, Optional
+
 
 import pyloudnorm as pyln
 import soundfile as sf
 from pydub import AudioSegment
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 _logger = logging.getLogger(__name__)
 
 
-
-def _arg_error(message: str) -> NoReturn:
-    _logger.critical(message)
-    raise ValueError
-
-
 _SILENCE_THRESHOLD = -16.0
+
+
+
+
+
+
+
+
+
+
+
+
+def _type_assert(obj: Any, t: type | Iterable[type]) -> NoReturn:
+
+    if isinstance(t, Iterable):
+        t = tuple(t)
+    if not isinstance(obj, t):
+        raise TypeError(f"{obj} must be {' or '.join(map(str, t)) if isinstance(t, tuple) else t}")
+
+
+def _value_assert(b: bool, message: str) -> NoReturn:
+    if not b:
+        raise ValueError(message)
+
+
+
+
 
 
 def silent_end_ind(sound: AudioSegment,
@@ -31,11 +69,22 @@ def silent_end_ind(sound: AudioSegment,
                    chunk_size: int = 1,
                   ) -> int:
 
-    if not (isinstance(silence_threshold, (int, float)) and silence_threshold < 0):
-        _arg_error("'silence_length' must be negative number")
+    # argument type and value checking
 
-    if not (isinstance(chunk_size, int) and chunk_size == 0):
-        _arg_error("'silence_length' must be a non-zero integer")
+    _type_assert(silence_threshold, (int, float))
+
+    _value_assert(not isinstance(silence_threshold, float)
+                  or  isfinite(silence_threshold),
+                  "'silence_threshold' must be finite.",
+                 )
+
+    _value_assert(silence_threshold < 0, "'silence_threshold' must be negative number")
+
+
+    _type_assert(chunk_size, int)
+
+    _value_assert(chunk_size != 0, "'chunk_size' must be a non-zero integer")
+
 
 
     # Copied and adapted from https://github.com/jiaaro/pydub/blob/master/pydub/silence.py
@@ -74,20 +123,45 @@ def process_song(
                  silence_padding     : int            = 0,
                 ) -> Optional[io.BytesIO]:
 
-    if not isinstance(allow_overwrite, bool):
-        _arg_error("'allow_overwrite' must be a boolean")
+    # argument type and value checking
 
-    if not (isinstance(lufs_normalize, (int, float)) and lufs_normalize <= 0):
-        _arg_error("'lufs_normalize' must be non-positive number")
+    _type_assert(allow_overwrite, bool)
 
-    if not (isinstance(silence_threshold, (int, float)) and silence_threshold < 0):
-        _arg_error("'silence_threshold' must be negative number")
+    _type_assert(lufs_normalize, (int, float))
 
-    if not (isinstance(iteration_chunk_len, (int, Fraction)) and iteration_chunk_len > 0):
-        _arg_error("'iteration_chunk_len' must be positive integer or fraction")
+    _value_assert(not isinstance(lufs_normalize, float)
+                  or  isfinite(lufs_normalize),
+                  "'lufs_normalize' must be finite.",
+                 )
 
-    if not (isinstance(silence_padding, int) and silence_padding < 0):
-        _arg_error("'silence_padding' must be positive integer")
+    _value_assert(lufs_normalize <= 0, "'lufs_normalize' must be non-positive number")
+
+    _type_assert(silence_threshold, (int, float))
+
+    _value_assert(not isinstance(silence_threshold, float)
+                  or  isfinite(silence_threshold),
+                  "'silence_threshold' must be finite.",
+                 )
+
+    _value_assert(silence_threshold < 0, "'silence_threshold' must be negative number")
+
+
+    _type_assert(iteration_chunk_len, (int, Fraction))
+
+    _value_assert(not isinstance(iteration_chunk_len, Fraction)
+                  or  iteration_chunk_len < 1,
+                  "'iteration_chunk_len' must be less than 1:1",
+                 )
+
+    _value_assert(iteration_chunk_len > 0,
+                  "'iteration_chunk_len' must be positive integer or fraction",
+                 )
+
+    _type_assert(silence_padding, int)
+
+    _value_assert(silence_padding >= 0, "'silence_padding' must be non-negative integer")
+
+
 
 
     if return_stream := output_audio is None and isinstance(input_audio, io.IOBase):
@@ -104,10 +178,12 @@ def process_song(
         if isinstance(output_audio, str):
             output_audio = Path(output_audio)
 
-        if not allow_overwrite and input_audio.resolve() == output_audio.resolve():
-            _arg_error(' '.join(("Must give permission to overwrite input file",
-                                  "or supply different output path.",
-                                 )))
+        _value_assert(   allow_overwrite
+                      or input_audio.resolve() != output_audio.resolve(),
+                      ' '.join(("Must give permission to overwrite input file",
+                                "or supply different output path.",
+                               )),
+                     )
 
 
 
@@ -235,7 +311,7 @@ if __name__ == "__main__":
                            "--iteration-chunk-len",
                            default=argparse.SUPPRESS,
                            help=' '.join(("Length of each chunk iteration in ms.",
-                                          "Must be integer or fraction > 0.",
+                                          "Must be integer > 0 or fraction in (0, 1).",
                                          )),
                           )
 
@@ -268,4 +344,14 @@ if __name__ == "__main__":
     try:
         assert process_song(**args) is None
     except ValueError as e:
-        parser.exit(2)
+        parser.error(str(e))
+
+
+
+
+
+
+
+
+
+
