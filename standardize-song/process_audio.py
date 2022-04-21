@@ -7,10 +7,11 @@ import io
 from pathlib import Path
 from typing import Optional, NoReturn
 
+from fractions import Fraction
+
 import pyloudnorm as pyln
 import soundfile as sf
 from pydub import AudioSegment
-from pydub.silence import detect_silence
 
 
 _logger = logging.getLogger(__name__)
@@ -22,26 +23,71 @@ def _arg_error(message: str) -> NoReturn:
     raise ValueError
 
 
+_SILENCE_THRESHOLD = -16.0
+
+
+def silent_end_ind(sound: AudioSegment,
+                   silence_threshold: int | float = _SILENCE_THRESHOLD,
+                   chunk_size: int = 1,
+                  ) -> int:
+
+    if not (isinstance(silence_threshold, (int, float)) and silence_threshold < 0):
+        _arg_error("'silence_length' must be negative number")
+
+    if not (isinstance(chunk_size, int) and chunk_size == 0):
+        _arg_error("'silence_length' must be a non-zero integer")
+
+
+    # Copied and adapted from https://github.com/jiaaro/pydub/blob/master/pydub/silence.py
+
+
+    if chunk_size > 0:
+        trim_ind = 0
+        while (
+                   sound[trim_ind : trim_ind + chunk_size].dBFS < silence_threshold
+               and trim_ind < len(sound)
+              ):
+            trim_ind += chunk_size
+
+        return min(trim_ind, len(sound))
+    else:
+        trim_ind = len(sound)
+        while (
+                   sound[trim_ind + chunk_size : trim_ind].dBFS < silence_threshold
+               and trim_ind > 0
+              ):
+            trim_ind += chunk_size
+
+        return max(trim_ind, 0)
+
+
+
+
+
 def process_song(
                  input_audio        ,
                  output_audio = None,
-                 allow_overwrite   : bool        = False,
-                 lufs_normalize    : int | float = -14.0,
-                 min_silence_len   : int         = 1000 ,
-                 silence_threshold : int | float = -30.0,
+                 allow_overwrite     : bool           = False,
+                 lufs_normalize      : int | float    = -14.0,
+                 silence_threshold   : int | float    = _SILENCE_THRESHOLD,
+                 iteration_chunk_len : int | Fraction = 1,
+                 silence_padding     : int            = 0,
                 ) -> Optional[io.BytesIO]:
 
     if not isinstance(allow_overwrite, bool):
         _arg_error("'allow_overwrite' must be a boolean")
 
     if not (isinstance(lufs_normalize, (int, float)) and lufs_normalize <= 0):
-        _arg_error("'silence_length' must be non-positive")
-
-    if not (isinstance(min_silence_len, int) and min_silence_len >= 0):
-        _arg_error("'minimum_silence_length' must be non-negative")
+        _arg_error("'lufs_normalize' must be non-positive number")
 
     if not (isinstance(silence_threshold, (int, float)) and silence_threshold < 0):
-        _arg_error("'silence_length' must be negative")
+        _arg_error("'silence_threshold' must be negative number")
+
+    if not (isinstance(iteration_chunk_len, (int, Fraction)) and iteration_chunk_len > 0):
+        _arg_error("'iteration_chunk_len' must be positive integer or fraction")
+
+    if not (isinstance(silence_padding, int) and silence_padding < 0):
+        _arg_error("'silence_padding' must be positive integer")
 
 
     if return_stream := output_audio is None and isinstance(input_audio, io.IOBase):
@@ -70,22 +116,44 @@ def process_song(
 
     song = AudioSegment.from_file(input_audio).normalize()
 
-    silence_segments = detect_silence(
-                                      song,
-                                      min_silence_len=min_silence_len,
-                                      silence_thresh=silence_threshold,
-                                     )
-
     _logger.debug("Length of 'input_audio': %d ms", len(song))
-    _logger.debug(f"Segments of detected silence: {silence_segments}")
 
-    if silence_segments and silence_segments != [[0, len(song)]]:
-        if silence_segments[-1][1] == len(song):
-            song = song[ : silence_segments[-1][0] ]
-        if silence_segments[0][0] == 0:
-            song = song[ silence_segments[0][1] : ]
+    if isinstance(iteration_chunk_len, Fraction):
+        iteration_chunk_len = max(round(iteration_chunk_len* len(song)), 1)
 
-    _logger.debug("New length of audio: %d ms", len(song))
+
+    _logger.debug(f"{iteration_chunk_len=} ms")
+
+
+    if (silent_leading_ind  := silent_end_ind(
+                                              song,
+                                              silence_threshold,
+                                              iteration_chunk_len,
+                                             )) not in {0, len(song)}:
+        song = song[ silent_leading_ind : ]
+        _logger.debug("{silent_leading_ind=} ms")
+
+    else:
+        _logger.info("Could not find any leading silence/whole song was silent")
+
+    if (silent_trailing_ind := silent_end_ind(
+                                              song,
+                                              silence_threshold,
+                                              -iteration_chunk_len,
+                                             )) not in {0, len(song)}:
+        song = song[ : silent_trailing_ind ]
+        _logger.debug("{silent_trailing_ind=} ms")
+
+    else:
+        _logger.info("Could not find any trailing silence/whole song was silent")
+
+
+    _logger.debug("Trimmed length of audio: %d ms", len(song))
+
+    padding = AudioSegment.silent(duration=silence_padding)
+    song = padding + song + padding
+
+    _logger.debug("New (padded) length of audio: %d ms", len(song))
 
     # compress
 
@@ -155,14 +223,7 @@ if __name__ == "__main__":
                            type=float,
                            help="Loudness standard to normalize to in LUFS. Must be <= 0.",
                           )
-    var_group.add_argument(
-                           "--min-silence-len",
-                           default=argparse.SUPPRESS,
-                           type=int,
-                           help=' '.join(("Minimum length of silence segment to consider",
-                                          "in milliseconds. Must be integer > 0.",
-                                          )),
-                          )
+
     var_group.add_argument(
                            "--silence-threshold",
                            default=argparse.SUPPRESS,
@@ -170,12 +231,39 @@ if __name__ == "__main__":
                            help="Volume threshold to consider silence in dBFS. Must be < 0.",
                           )
 
+    var_group.add_argument(
+                           "--iteration-chunk-len",
+                           default=argparse.SUPPRESS,
+                           help=' '.join(("Length of each chunk iteration in ms.",
+                                          "Must be integer or fraction > 0.",
+                                         )),
+                          )
+
+    var_group.add_argument(
+                           "--silence-padding",
+                           default=argparse.SUPPRESS,
+                           type=int,
+                           help="Silence padded to each end in ms. Must be integer > 0.",
+                          )
+
+
 
 
     args = vars(parser.parse_args())
 
     logging.basicConfig(level=logging.DEBUG if args.pop("debug") else logging.WARNING)
 
+    if iteration_chunk_len := args.get("iteration_chunk_len"):
+        if iteration_chunk_len.count('/'):
+            try:
+                args["iteration_chunk_len"] = Fraction(iteration_chunk_len)
+            except ValueError:
+                pass
+        else:
+            try:
+                args["iteration_chunk_len"] = int(iteration_chunk_len)
+            except ValueError:
+                pass
 
     try:
         assert process_song(**args) is None
