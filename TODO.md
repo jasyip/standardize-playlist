@@ -1,0 +1,1 @@
+- Preserve bitrate and floating point type

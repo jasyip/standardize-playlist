@@ -6,14 +6,16 @@ import logging
 import sys
 from collections.abc import Iterable
 from fractions import Fraction
-from math import isfinite
+import math
 from pathlib import Path
 from typing import Any, Optional
 
+from pprint import pformat
 
 import pyloudnorm as pyln
 import soundfile as sf
 from pydub import AudioSegment
+from ffmpeg_bitrate_stats.__main__ import BitrateStats
 
 
 
@@ -72,7 +74,7 @@ def silent_end_ind(sound: AudioSegment,
     _type_assert(silence_threshold, (int, float))
 
     _value_assert(not isinstance(silence_threshold, float)
-                  or  isfinite(silence_threshold),
+                  or  math.isfinite(silence_threshold),
                   "'silence_threshold' must be finite.",
                  )
 
@@ -114,8 +116,10 @@ def silent_end_ind(sound: AudioSegment,
 def process_song(
                  input_audio        ,
                  output_audio = None,
+                 input_format  : Optional[str] = None,
+                 output_format : Optional[str] = None,
                  allow_overwrite     : bool                  = False,
-                 lufs_normalize      : int | float           = -14.0,
+                 lufs_normalize      : int | float           = -16.0,
                  silence_threshold   : Optional[int | float] = None,
                  iteration_chunk_len : int | Fraction        = 1,
                  silence_padding     : int                   = 0,
@@ -128,7 +132,7 @@ def process_song(
     _type_assert(lufs_normalize, (int, float))
 
     _value_assert(not isinstance(lufs_normalize, float)
-                  or  isfinite(lufs_normalize),
+                  or  math.isfinite(lufs_normalize),
                   "'lufs_normalize' must be finite.",
                  )
 
@@ -138,7 +142,7 @@ def process_song(
         _type_assert(silence_threshold, (int, float))
 
         _value_assert(not isinstance(silence_threshold, float)
-                      or  isfinite(silence_threshold),
+                      or  math.isfinite(silence_threshold),
                       "'silence_threshold' must be finite.",
                      )
 
@@ -186,6 +190,17 @@ def process_song(
 
 
 
+    # ffmpeg-bitrate-stats
+
+    bitrate_stats = BitrateStats(input_audio,
+                                 stream_type="audio",
+                                 chunk_size=0.1,
+                                )
+    bitrate_stats.calculate_statistics()
+    target_bitrate = math.ceil(bitrate_stats.bitrate_stats["max_bitrate"])
+    _logger.debug(pformat(bitrate_stats.bitrate_stats, width=100, indent=4))
+
+
 
     # pydub
 
@@ -198,13 +213,13 @@ def process_song(
 
 
     _logger.debug(f"{iteration_chunk_len=} ms")
+    _logger.debug("dBFS of audio before silence trimming: %.6f", song.dBFS)
 
 
-    local_args = locals()
-    silent_end_ind_args = { arg : local_args[arg] for arg in {
-                                                              "silence_threshold",
-                                                              "iteration_chunk_len",
-                                                             }}
+    silent_end_ind_args = {
+                           "silence_threshold" : silence_threshold,
+                           "chunk_size"        : iteration_chunk_len,
+                          }
     silent_end_ind_args = { k : v for k, v in silent_end_ind_args.items() if v is not None}
 
     if (silent_leading_ind  := silent_end_ind(
@@ -212,23 +227,31 @@ def process_song(
                                               **silent_end_ind_args,
                                              )) not in {0, len(song)}:
         song = song[ silent_leading_ind : ]
-        _logger.debug("{silent_leading_ind=} ms")
+        _logger.debug(f"{silent_leading_ind=} ms")
 
     else:
         _logger.info("Could not find any leading silence/whole song was silent")
+
+
+    silent_end_ind_args = {
+                           "silence_threshold" : silence_threshold,
+                           "chunk_size"        : -iteration_chunk_len,
+                          }
+    silent_end_ind_args = { k : v for k, v in silent_end_ind_args.items() if v is not None}
 
     if (silent_trailing_ind := silent_end_ind(
                                               song,
                                               **silent_end_ind_args,
                                              )) not in {0, len(song)}:
         song = song[ : silent_trailing_ind ]
-        _logger.debug("{silent_trailing_ind=} ms")
+        _logger.debug(f"{silent_trailing_ind=} ms")
 
     else:
         _logger.info("Could not find any trailing silence/whole song was silent")
 
 
     _logger.debug("Trimmed length of audio: %d ms", len(song))
+    _logger.debug("dBFS of audio after silence trimming: %.6f", song.dBFS)
 
     padding = AudioSegment.silent(duration=silence_padding)
     song = padding + song + padding
@@ -237,30 +260,58 @@ def process_song(
 
     # compress
 
-    _logger.debug("dBFS of audio currently: %.6f", song.dBFS)
+    _logger.debug("dBFS of audio before compression: %.6f", song.dBFS)
 
     song = song.compress_dynamic_range()
 
     _logger.debug("dBFS of compressed audio: %.6f", song.dBFS)
 
-    intermediate_stream = io.BytesIO()
 
-    song.export(intermediate_stream, format="wav")
+    with io.BytesIO() as intermediate_stream:
+
+        song.export(intermediate_stream, format="wav")
+        # song.export(intermediate_stream, format="wav", bitrate=target_bitrate)
 
 
-    # normalize
-    data, rate = sf.read(intermediate_stream)
+        Path(input_audio).with_stem(Path(input_audio).stem + ".pydub").with_suffix(".wav").write_bytes(intermediate_stream.getbuffer())
 
+
+
+        data, rate = sf.read(intermediate_stream)
+
+    input_subtype = sf.SoundFile(input_audio).subtype
 
 
     # measure the loudness first 
     meter = pyln.Meter(rate) # create BS.1770 meter
     loudness = meter.integrated_loudness(data)
 
-    # loudness normalize audio to -12 dB LUFS
+    # loudness normalize audio
     loudness_normalized_audio = pyln.normalize.loudness(data, loudness, lufs_normalize)
 
-    sf.write(output_audio, loudness_normalized_audio, rate)
+
+    with io.BytesIO() as intermediate_stream:
+
+        sf.write(intermediate_stream,
+                 loudness_normalized_audio,
+                 rate,
+                 format="wav",
+                 subtype=input_subtype
+                )
+
+        Path(input_audio).with_stem(Path(input_audio).stem + ".sf").with_suffix(".wav").write_bytes(intermediate_stream.getbuffer())
+
+        song = AudioSegment.from_file(intermediate_stream,
+                                      format="wav",
+                                     )
+
+    song.export(output_audio,
+                format=output_audio.suffix.removeprefix('.'),
+                bitrate=f"{target_bitrate}k"
+               )
+
+
+
 
     return output_audio if return_stream else None
 
